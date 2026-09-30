@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+حساب خمس - برنامه‌ی محلی (بدون نیاز به نصب بسته)
+
+اجرا:        python khums.py
+پورت دلخواه: python khums.py --port 9000
+
+- فقط Python 3.8 یا بالاتر لازم است. هیچ بسته‌ای نصب نمی‌شود.
+- داده‌ها در پوشه‌ی ~/.khums (یا مسیر KHUMS_HOME) ذخیره می‌شوند.
+- بات و تحلیل شأن به کلید API انتروپیک نیاز دارند (console.anthropic.com).
+  کلید را در تب «بات» وارد کن یا متغیر ANTHROPIC_API_KEY را تنظیم کن.
+- مدل پیش‌فرض claude-sonnet-5-5 است؛ با KHUMS_MODEL عوض می‌شود.
+- سرور فقط روی همین کامپیوتر (127.0.0.1) در دسترس است.
+
+انتشار به‌عنوان سایت عمومی: KHUMS_HOSTED=1 و ANTHROPIC_API_KEY را تنظیم کن (راهنما در README).
+متغیرهای اختیاری: PORT، KHUMS_RATE (درخواست بات در ساعت برای هر IP، پیش‌فرض ۳۰)، KHUMS_DAILY (کل در روز، پیش‌فرض ۵۰۰).
+"""
+import argparse, collections, json, os, sys, threading, time, urllib.request, urllib.error, webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOME = Path(os.environ.get("KHUMS_HOME", Path.home() / ".khums"))
+STATE, CONF = HOME / "state.json", HOME / "config.json"
+MODEL = os.environ.get("KHUMS_MODEL", "claude-sonnet-5-5")
+LOCK = threading.Lock()
+
+# حالت سرور عمومی (KHUMS_HOSTED=1): داده‌ها فقط در مرورگر هر بازدیدکننده می‌ماند،
+# کلید فقط از متغیر محیطی خوانده می‌شود و برای بات سقف استفاده گذاشته می‌شود.
+HOSTED = os.environ.get("KHUMS_HOSTED") == "1"
+RATE = int(os.environ.get("KHUMS_RATE", "30"))     # درخواست بات در ساعت برای هر IP
+DAILY = int(os.environ.get("KHUMS_DAILY", "500"))  # کل درخواست بات در روز
+HITS, DAY = collections.defaultdict(list), {"d": "", "n": 0}
+
+
+def allowed(ip):
+    now, today = time.time(), time.strftime("%Y-%m-%d")
+    with LOCK:
+        if len(HITS) > 5000:
+            HITS.clear()
+        if DAY["d"] != today:
+            DAY.update(d=today, n=0)
+        lst = [t for t in HITS[ip] if now - t < 3600]
+        if len(lst) >= RATE or DAY["n"] >= DAILY:
+            HITS[ip] = lst
+            return False
+        lst.append(now)
+        HITS[ip] = lst
+        DAY["n"] += 1
+        return True
+
+
+def read_json(p, default):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_json(p, obj, private=False):
+    HOME.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    with LOCK:
+        tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+        if private:
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+        os.replace(tmp, p)
+
+
+def get_key():
+    k = os.environ.get("ANTHROPIC_API_KEY")
+    if k or HOSTED:
+        return k or ""
+    return read_json(CONF, {}).get("key", "")
+
+
+def chat(turns):
+    key = get_key()
+    if not key:
+        return {"error": "no_key"}
+    msgs = []
+    for t in turns[-12:]:
+        role = "assistant" if t.get("role") == "assistant" else "user"
+        text = str(t.get("content", ""))[:6000]
+        if msgs and msgs[-1]["role"] == role:
+            msgs[-1]["content"] += "\n" + text
+        else:
+            msgs.append({"role": role, "content": text})
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
+    if not msgs:
+        return {"error": "پیام نامعتبر"}
+    body = json.dumps({"model": MODEL, "max_tokens": 900 if HOSTED else 1500, "messages": msgs}).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body, method="POST",
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        text = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
+        return {"text": text or "پاسخی دریافت نشد."}
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:
+            msg = ""
+        return {"error": "خطای %s %s" % (e.code, msg)}
+    except Exception as e:
+        return {"error": "اتصال برقرار نشد: %s" % e}
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _ok_host(self):
+        if HOSTED:
+            return True
+        host = (self.headers.get("Host") or "").split(":")[0]
+        return host in ("127.0.0.1", "localhost")
+
+    def _ip(self):
+        x = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip()
+        return x or self.client_address[0]
+
+    def _send(self, code, data, ctype="application/json; charset=utf-8"):
+        b = data if isinstance(data, bytes) else data.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        if not self._ok_host():
+            return self._send(403, "{}")
+        if self.path in ("/", "/index.html"):
+            st = "{}" if HOSTED else json.dumps(read_json(STATE, {}), ensure_ascii=False).replace("</", "<\\/")
+            page = HTML.replace("__STATE_JSON__", st)
+            if HOSTED:
+                page = page.replace("<title>", "<script>window.__HOSTED__=true</script><title>", 1)
+            return self._send(200, page, "text/html; charset=utf-8")
+        if self.path == "/healthz":
+            return self._send(200, "ok", "text/plain")
+        if self.path == "/api/key":
+            return self._send(200, json.dumps({"has": bool(get_key())}))
+        self._send(404, "{}")
+
+    def do_POST(self):
+        if not self._ok_host() or self.headers.get("X-Khums") != "1":
+            return self._send(403, "{}")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 20_000_000:
+                return self._send(413, "{}")
+            data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+        except Exception:
+            return self._send(400, "{}")
+        if self.path == "/api/state":
+            if isinstance(data, dict) and not HOSTED:
+                write_json(STATE, data)
+            return self._send(200, "{}")
+        if self.path == "/api/key":
+            if HOSTED:
+                return self._send(403, "{}")
+            k = str(data.get("key", "")).strip()
+            if k:
+                write_json(CONF, {"key": k}, private=True)
+            return self._send(200, json.dumps({"has": bool(get_key())}))
+        if self.path == "/api/chat":
+            if HOSTED and not allowed(self._ip()):
+                return self._send(200, json.dumps({"error": "سقف استفاده‌ی ساعتی پر شده؛ کمی بعد دوباره امتحان کن."}, ensure_ascii=False))
+            return self._send(200, json.dumps(chat(data.get("turns", [])), ensure_ascii=False))
+        self._send(404, "{}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--no-browser", action="store_true")
+    a = ap.parse_args()
+    host = "0.0.0.0" if HOSTED else "127.0.0.1"
+    start = int(os.environ.get("PORT", a.port))
+    srv = None
+    for p in range(start, start + (1 if HOSTED else 20)):
+        try:
+            srv = ThreadingHTTPServer((host, p), H)
+            break
+        except OSError:
+            continue
+    if not srv:
+        sys.exit("پورت آزاد پیدا نشد.")
+    url = "http://127.0.0.1:%d/" % srv.server_address[1]
+    print("حساب خمس اجرا شد:", url, "\nبرای خروج Ctrl+C بزن.")
+    if not a.no_browser and not HOSTED:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+HTML = r'''<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;800&display=swap" rel="stylesheet">
+<title>حساب خمس</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#f6f4ee;--card:#fff;--tx:#1f2a24;--mu:#6b756e;--ac:#1f6f50;--ac2:#e3f1ea;--bd:#dcd8cc;--rd:#b3372c}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141a17;--card:#1d2621;--tx:#e8ece9;--mu:#95a19a;--ac:#4cc18f;--ac2:#22352c;--bd:#2f3c35;--rd:#ef7d70}}
+:root[data-theme="dark"]{--bg:#141a17;--card:#1d2621;--tx:#e8ece9;--mu:#95a19a;--ac:#4cc18f;--ac2:#22352c;--bd:#2f3c35;--rd:#ef7d70}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:Vazirmatn,Tahoma,"Segoe UI",sans-serif;line-height:1.7}
+.w{max-width:680px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:4px 0 2px}
+.sub{color:var(--mu);font-size:13px;margin-bottom:12px}
+.tabs{display:flex;gap:6px;margin:12px 0}
+.tabs button{flex:1;padding:9px;border:1px solid var(--bd);background:var(--card);color:var(--tx);border-radius:10px;font:inherit;cursor:pointer}
+.tabs button.on{background:var(--ac);color:#fff;border-color:var(--ac)}
+.c{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:12px}
+.c h2{font-size:16px;margin:0 0 8px}
+label{display:block;font-size:13px;color:var(--mu);margin:8px 0 3px}
+input,select,textarea{width:100%;padding:9px;border:1px solid var(--bd);border-radius:9px;background:var(--bg);color:var(--tx);font:inherit}
+.r{display:flex;gap:8px}.r>*{flex:1}
+.b{background:var(--ac);color:#fff;border:0;border-radius:10px;padding:10px 14px;font:inherit;cursor:pointer;margin-top:10px;width:100%}
+.b.s{background:var(--ac2);color:var(--ac)}
+.big{font-size:28px;font-weight:700;color:var(--ac);margin:4px 0}
+.row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px dashed var(--bd);font-size:14px}
+.row:last-child{border:0}
+.it{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--bd);font-size:14px}
+.it small{color:var(--mu);display:block}
+.tag{font-size:11px;padding:1px 7px;border-radius:9px;background:var(--ac2);color:var(--ac)}
+.x{background:none;border:0;color:var(--rd);cursor:pointer;font-size:18px}
+.note{font-size:12px;color:var(--mu)}
+#log{max-height:380px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:8px}
+.m{padding:9px 12px;border-radius:12px;max-width:90%;white-space:pre-wrap;font-size:14px}
+.m.u{background:var(--ac);color:#fff;align-self:flex-start}
+.m.a{background:var(--ac2);align-self:flex-end}
+.hide{display:none}
+.dp{display:flex;gap:4px}.dp input{width:30%}.dp select{width:40%;padding:9px 4px}
+.chip{font-size:12px;padding:4px 10px;border-radius:14px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);cursor:pointer;font-family:inherit}
+.pv{margin-top:8px;padding:10px;border-radius:10px;background:var(--ac2);font-size:14px}
+body{background:var(--bg) radial-gradient(circle at 100% 0,var(--ac2),transparent 45%) no-repeat}
+.hero{border-radius:22px;padding:22px 18px;margin-bottom:6px;color:#fff;position:relative;overflow:hidden;background:linear-gradient(135deg,#0b4f3b,#1b8a65 60%,#c9a24b);box-shadow:0 10px 30px rgba(15,90,68,.25)}
+.hero:before{content:"";position:absolute;inset:0;opacity:.13;background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='44' height='44'%3E%3Cpath d='M22 2l5 10 11 1-8 8 2 11-10-5-10 5 2-11-8-8 11-1z' fill='none' stroke='white' stroke-width='1.2'/%3E%3C/svg%3E")}
+.hero *{position:relative}.hero h1{font-size:28px;font-weight:800;margin:0}.hero .sub{color:#e6f4ed;margin:2px 0 0}
+.c{box-shadow:0 6px 22px rgba(0,0,0,.06);animation:up .35s both}
+@keyframes up{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.tabs button{font-weight:600;transition:.2s}.tabs button.on{background:linear-gradient(135deg,var(--ac),#1a8f66);box-shadow:0 4px 14px rgba(31,111,80,.35)}
+.b{background:linear-gradient(135deg,var(--ac),#1a8f66);box-shadow:0 4px 12px rgba(31,111,80,.25);font-weight:600;transition:.15s}.b:active{transform:scale(.98)}
+.b.s{background:var(--ac2);box-shadow:none}
+.big{font-size:32px;font-weight:800}
+.top{display:flex;align-items:center;gap:14px}
+.row b{background:var(--ac2);padding:0 9px;border-radius:8px}
+.it{transition:.15s}.it:hover{background:var(--ac2)}
+.c h2{display:flex;align-items:center;gap:6px}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .b:not(.s),:root:not([data-theme="light"]) .tabs button.on{color:#04140d}}
+:root[data-theme="dark"] .b:not(.s),:root[data-theme="dark"] .tabs button.on{color:#04140d}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
+.tl{border-radius:12px;padding:8px 6px;text-align:center;background:linear-gradient(160deg,var(--ac2),transparent);border:1px solid var(--bd)}
+.tl span{display:block;font-size:11px;color:var(--mu)}.tl b{font-size:14px}
+.tabs{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;padding:6px 0;background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.c h2:before{content:"";width:4px;height:18px;border-radius:3px;background:linear-gradient(var(--ac),#c9a24b)}
+</style>
+</head>
+<body>
+<div class="w">
+<div class="hero"><h1>🕌 حساب خمس</h1><div class="sub">بر اساس فتاوای آیت‌الله مکارم شیرازی · خمس ۲۰٪ مازاد درآمد بر مخارج سال</div></div>
+<div class="tabs"><button id="t1" class="on">📊 محاسبه</button><button id="t2">✍️ ثبت</button><button id="t4">🧭 شأن</button><button id="t3">🤖 بات</button></div>
+
+<div id="p1">
+  <div class="c">
+    <h2>سال خمسی</h2>
+    <label>تاریخ شروع سال خمسی (شمسی)</label>
+    <div class="dp" id="start"></div>
+    <div class="note" id="yend" style="margin-top:6px"></div>
+  </div>
+  <div class="c">
+    <h2>خمس واجب</h2>
+    <div class="top"><svg width="88" height="88" viewBox="0 0 36 36"><circle cx="18" cy="18" r="15.915" fill="none" stroke="var(--bd)" stroke-width="3"/><circle id="rp" cx="18" cy="18" r="15.915" fill="none" stroke="var(--ac)" stroke-width="3" stroke-linecap="round" stroke-dasharray="0 100" transform="rotate(-90 18 18)" style="transition:stroke-dasharray .6s"/><text id="rt" x="18" y="20.5" text-anchor="middle" font-size="7" font-weight="700" fill="var(--tx)">۰٪</text></svg><div><div class="big" id="kh">۰</div><div class="note" id="khn"></div></div></div>
+    <div class="tiles"><div class="tl"><span>درآمد مشمول</span><b id="tl1">۰</b></div><div class="tl"><span>مخارج و خرید لازم</span><b id="tl2">۰</b></div><div class="tl"><span>مازاد</span><b id="tl3">۰</b></div></div>
+    <div style="margin-top:8px">
+      <div class="row"><span>درآمد مشمول خمس</span><b id="s_in">۰</b></div>
+      <div class="row"><span>مخارج متعارف زندگی</span><b id="s_ex">۰</b></div>
+      <div class="row"><span>خریدهای لازم و متناسب با شأن</span><b id="s_pu">۰</b></div>
+      <div class="row"><span>خرید از پس‌انداز بدون خمس</span><b id="s_un">۰</b></div>
+      <div class="row"><span>مازاد (مشمول خمس)</span><b id="s_su">۰</b></div>
+      <div class="row"><span>خمس ۲۰٪ (مازاد + پس‌انداز بدون خمس)</span><b id="s_kh">۰</b></div>
+      <div class="row"><span>خمس سایر موارد (معدن، گنج و...)</span><b id="s_ot">۰</b></div>
+      <div class="row"><span id="s_bl">تراز سال قبل</span><b id="s_bv">۰</b></div>
+      <div class="row"><span>پرداخت‌شده در این سال</span><b id="s_pa">۰</b></div>
+      <div class="row"><span>باقی‌مانده برای پرداخت</span><b id="s_re">۰</b></div>
+    </div>
+  </div>
+  <div class="c">
+    <h2>ثبت پرداخت خمس</h2>
+    <div class="r"><div><label>مبلغ (تومان)</label><input id="pam" inputmode="numeric" placeholder="0"></div><div><label>تاریخ پرداخت (شمسی)</label><div class="dp" id="pdt"></div></div></div>
+    <label>توضیح</label><input id="pnt" placeholder="مثلاً پرداخت به وکیل مرجع">
+    <button class="b" id="padd">ثبت پرداخت</button>
+    <div id="plist" style="margin-top:8px"></div>
+  </div>
+  <div class="c">
+    <h2>پس‌انداز خمس‌داده</h2>
+    <div class="note">مبلغی که خمسش را داده‌ای و سال بعد دوباره خمس نمی‌گیرد. با بستن سال به‌طور خودکار زیاد می‌شود و می‌توانی دستی هم اصلاحش کنی.</div>
+    <label>مقدار (تومان)</label><input id="clr" inputmode="numeric" placeholder="0">
+    <div class="note" id="avn" style="margin-top:6px"></div>
+  </div>
+  <div class="c">
+    <h2>بستن سال خمسی</h2>
+    <div class="note">وقتی سال خمسی تمام شد، سال را ببند تا مازاد خمس‌داده در حافظه بماند و سال جدید از امروز شروع شود.</div>
+    <button class="b s" id="close">بستن سال و شروع سال جدید</button>
+    <div id="cf" class="pv hide"><div id="cft"></div><button class="b" id="cfok">تأیید و بستن سال</button></div>
+  </div>
+  <div class="c hide" id="yc"><h2>سال‌های بسته‌شده</h2><div id="ylist"></div></div>
+  <div class="c">
+    <h2>📖 قواعد به‌کاررفته</h2>
+    <div class="note" style="line-height:2">
+    • خمس ارباح مکاسب ۲۰٪ مازاد بر مخارج سال است.<br>
+    • هدیه و جایزه: بنابر احتیاط واجب، اگر از مخارج سال زیاد بیاید خمس دارد.<br>
+    • ارث و مهریه خمس ندارند (مگر مورث خمس نداده و وارث بداند).<br>
+    • خانه، ماشین، لوازم و زیورآلات متعارف و در حد شأن که از درآمد بین سال خریده شوند خمس ندارند؛ با پس‌انداز بدون خمس، خمس دارند.<br>
+    • افزایش قیمت سرمایه، نفقه و آذوقه‌ی باقی‌مانده در آخر سال خمس دارند.<br>
+    • معدن نصاب ندارد؛ نصاب گنج ۱۵ مثقال طلا یا ۱۰۵ مثقال نقره است.<br>
+    • منبع: استفتائات و رساله‌ی ایشان در makarem.ir؛ ممکن است دفتر ایشان تغییری داده باشد.
+    </div>
+  </div>
+  <div class="c">
+    <h2>پشتیبان‌گیری</h2>
+    <div class="note">داده‌ها فقط در مرورگر ذخیره می‌شوند. از آن‌ها پشتیبان بگیر و متن را جایی نگه دار.</div>
+    <textarea id="bk" rows="3" placeholder="متن پشتیبان اینجا نشان داده می‌شود؛ برای بازیابی، متن را اینجا بچسبان"></textarea>
+    <div class="r"><button class="b s" id="bdl">دانلود پشتیبان</button><button class="b s" id="brs">بازیابی از متن</button></div>
+    <div class="note" id="bn"></div>
+  </div>
+  <div class="note">این محاسبه ابزار کمکی است و جای رساله یا نظر دفتر مرجع را نمی‌گیرد. موارد مشکوک را از دفتر ایشان بپرس. خمس را به مرجع یا وکیل مجاز بده؛ لازم نیست مرجع خودت باشد، مگر مرجع به عنوان حکم حاکم آن را بخواهد.</div>
+</div>
+
+<div id="p2" class="hide">
+  <div class="c">
+    <h2>افزودن مورد</h2>
+    <label>نوع</label>
+    <select id="kind">
+      <option value="income">درآمد</option>
+      <option value="expense">مخارج زندگی</option>
+      <option value="purchase">خرید</option>
+    </select>
+    <label id="flagl">وضعیت</label>
+    <select id="flag"></select>
+    <div id="pf" class="hide">
+      <label>پول خرید از کجا آمده؟</label>
+      <select id="src"><option value="year">درآمد همین سال خمسی</option><option value="paid">پس‌انداز قدیمی که خمسش داده شده</option><option value="unpaid">پس‌انداز قدیمی که خمسش داده نشده</option></select>
+      <label>سهم متناسب با شأن (تومان) — خالی یعنی همه‌ی مبلغ</label>
+      <input id="shaan" inputmode="numeric" placeholder="اختیاری">
+      <button class="b s" id="chk" type="button">🧭 بررسی تناسب با شأن من</button>
+      <div class="pv hide" id="sv"></div>
+    </div>
+    <div class="r">
+      <div><label>مبلغ (تومان)</label><input id="amt" inputmode="numeric" placeholder="0"></div>
+      <div><label>تاریخ (شمسی)</label><div class="dp" id="dt"></div></div>
+    </div>
+    <label>توضیح</label>
+    <input id="nt" placeholder="مثلاً حقوق مهر، خرید یخچال...">
+    <button class="b" id="add">افزودن</button>
+    <div class="note" id="hint" style="margin-top:8px"></div>
+    <div class="pv hide" id="pv"></div>
+  </div>
+  <div class="c">
+    <h2>سایر موارد خمس</h2>
+    <div class="note">این موارد بعد از یک سال نمی‌ماند؛ خمسشان همان موقع واجب می‌شود و از مخارج سال کم نمی‌شود.</div>
+    <label>نوع</label><select id="ofl"><option value="mine">معدن (نصاب ندارد؛ مبلغ خالص پس از کسر هزینه)</option><option value="treasure">گنج (نصاب: ۱۵ مثقال طلا یا ۱۰۵ مثقال نقره؛ پس از کسر هزینه)</option><option value="dive">غواصی (مروارید، مرجان و...)</option><option value="mixed">مال حلال مخلوط به حرام (کل مال، مقدار و صاحب حرام نامعلوم)</option><option value="dhimmi">زمینی که کافر ذمی از مسلمان خریده (ارزش زمین)</option></select>
+    <div class="r"><div><label>مبلغ (تومان)</label><input id="oam" inputmode="numeric" placeholder="0"></div><div><label>تاریخ (شمسی)</label><div class="dp" id="odt"></div></div></div>
+    <label>قیمت هر گرم طلای ۲۴ عیار (برای نصاب گنج و غواصی)</label><input id="gold" inputmode="numeric" placeholder="تومان">
+    <label>قیمت هر گرم نقره (اختیاری، برای نصاب گنج)</label><input id="silver" inputmode="numeric" placeholder="تومان">
+    <label>توضیح</label><input id="ont">
+    <button class="b" id="oadd">افزودن</button>
+    <div id="olist" style="margin-top:8px"></div>
+  </div>
+  <div class="c"><h2>موارد ثبت‌شده</h2><div id="list"></div></div>
+</div>
+
+<div id="p4" class="hide">
+  <div class="c">
+    <h2>🎁 ارفاق برای اولین‌بار</h2>
+    <div class="note">اگر تا حالا خمس نداده‌ای، دفاتر ایشان از باب ارفاق این چهار مورد موجود را از محاسبه کنار می‌گذارند: خانه‌ی مسکونی (و ییلاقی در حد شأن)، وسیله‌ی نقلیه، لوازم زندگی (حتی موبایل اگر وسیله‌ی کسب نباشد) و زیورآلات متعارف بانوان. این‌ها را جزو پس‌انداز ثبت نکن.</div>
+  </div>
+  <div class="c">
+    <h2>🧭 شان‌سنج</h2>
+    <div class="note">شأن را عرف تعیین می‌کند، نه یک عدد ثابت. با چند سؤال، وضعیتت را ثبت می‌کنم تا هنگام خرید بتوانم تناسب آن را با شأنت بسنجم. تشخیص نهایی با خودت و مرجع است.</div>
+    <div id="qs"></div>
+    <button class="b" id="anl">تحلیل شأن من</button>
+    <div class="pv hide" id="pr"></div>
+  </div>
+</div>
+
+<div id="p3" class="hide">
+  <div class="c">
+    <h2>پرسش از بات خمس</h2>
+    <div id="chips" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"></div>
+    <div id="log"><div class="m a">سلام! هر سؤالی درباره‌ی خمس داری بپرس (بر اساس فتاوای آیت‌الله مکارم). به اطلاعاتی که ثبت کرده‌ای هم دسترسی دارم.</div></div>
+    <textarea id="q" rows="2" placeholder="سؤالت را بنویس..."></textarea>
+    <button class="b" id="send">ارسال</button>
+    <div class="note" id="cn"></div>
+    <label>کلید API انتروپیک (فقط روی همین کامپیوتر ذخیره می‌شود)</label>
+    <input id="apik" type="password" dir="ltr" placeholder="sk-ant-...">
+    <button class="b s" id="apis" type="button">ذخیره‌ی کلید</button>
+    <div class="note" id="apin"></div>
+  </div>
+</div>
+</div>
+
+<script>window.__STATE__=__STATE_JSON__;</script>
+<script>
+const claude={use:async n=>{
+ if(n==='sample')return async(turns,o)=>{
+  let r,d;try{r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json','X-Khums':'1'},body:JSON.stringify({turns})});d=await r.json()}catch(e){throw{code:'net'}}
+  if(d.error==='no_key')throw{code:'no_key'};if(d.error)throw{code:'api',message:d.error};
+  if(o&&o.onText)o.onText({text:d.text});return{text:d.text}};
+ if(n==='downloads')return{save:async({filename,data})=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type:'application/json'}));a.download=filename;document.body.append(a);a.click();a.remove()}};
+ return null}};
+const $=id=>document.getElementById(id);
+const fa=n=>Math.round(n).toLocaleString('fa-IR');
+const num=s=>{s=String(s||'').replace(/[۰-۹]/g,d=>'۰۱۲۳۴۵۶۷۸۹'.indexOf(d)).replace(/[٠-٩]/g,d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/[^\d.]/g,'');return parseFloat(s)||0};
+const dv=(a,b)=>Math.floor(a/b);
+function g2j(gy,gm,gd){const t=[0,31,59,90,120,151,181,212,243,273,304,334];let jy=gy<=1600?0:979;gy-=gy<=1600?621:1600;const g2=gm>2?gy+1:gy;let d=365*gy+dv(g2+3,4)-dv(g2+99,100)+dv(g2+399,400)-80+gd+t[gm-1];jy+=33*dv(d,12053);d%=12053;jy+=4*dv(d,1461);d%=1461;if(d>365){jy+=dv(d-1,365);d=(d-1)%365}return[jy,d<186?1+dv(d,31):7+dv(d-186,30),1+(d<186?d%31:(d-186)%30)]}
+const MN=['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
+const p2=n=>String(n).padStart(2,'0');
+function todayJ(){const n=new Date(),j=g2j(n.getFullYear(),n.getMonth()+1,n.getDate());return j[0]+'-'+p2(j[1])+'-'+p2(j[2])}
+function mkDate(id,val,cb){const e=$(id);e.innerHTML='<input inputmode="numeric" maxlength="4" placeholder="سال"><select><option value="">ماه</option>'+MN.map((m,i)=>`<option value="${i+1}">${m}</option>`).join('')+'</select><input inputmode="numeric" maxlength="2" placeholder="روز">';
+ const [y,m,d]=(val||'').split('-');if(val){e.children[0].value=y;e.children[1].value=+m;e.children[2].value=+d}
+ [...e.children].forEach(c=>c.onchange=()=>cb&&cb())}
+function getDate(id){const c=$(id).children,y=num(c[0].value),m=num(c[1].value),d=num(c[2].value);return y&&m&&d?y+'-'+p2(m)+'-'+p2(d):''}
+function showD(s){if(!s)return'';const[y,m,d]=s.split('-').map(Number);return fa(d).replace(/٬/g,'')+' '+MN[m-1]+' '+String(y).replace(/\d/g,x=>'۰۱۲۳۴۵۶۷۸۹'[x])}
+
+let S={start:'',paid:'',items:[],pays:[],cleared:0,bal:0,years:[],others:[],gold:''};
+try{const r=(window.__STATE__&&window.__STATE__.items)?JSON.stringify(window.__STATE__):localStorage.getItem('khums_v2');if(r)S=Object.assign(S,JSON.parse(r));else{const o=localStorage.getItem('khums_v1');if(o){S=Object.assign(S,JSON.parse(o));const cv=d=>{if(d&&+d.slice(0,4)>1700){const j=g2j(+d.slice(0,4),+d.slice(5,7),+d.slice(8,10));return j[0]+'-'+p2(j[1])+'-'+p2(j[2])}return d};S.start=cv(S.start);S.items.forEach(i=>i.date=cv(i.date))}}}catch(e){}
+if(S.paid&&!S.pays.length)S.pays=[{id:1,date:S.start||todayJ(),amt:num(S.paid),note:'ثبت قبلی'}];S.paid='';
+S.items.forEach(i=>{if(i.flag==='bigift')i.flag='gift'});
+const save=()=>{const t=JSON.stringify(S);try{localStorage.setItem('khums_v2',t)}catch(e){}if(!window.__HOSTED__)fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json','X-Khums':'1'},body:t}).catch(()=>{})};
+
+// [key,label,flag] flag: income=has khums, purchase=necessary
+const FL={
+ income:[['sal','حقوق و دستمزد',1],['pens','حقوق بازنشستگی',1],['biz','سود تجارت و کسب و کار',1],['rent','اجاره‌ی ملک',1],['inv','سود سپرده یا سهام',1],['gap','افزایش ارزش سرمایه (طلا، ارز، ملک، سهام)',1],['bon','پاداش و مزایای کاری',1],['gift','هدیه و جایزه (بنابر احتیاط واجب)',1],['nafaq','نفقه‌ی دریافتی (باقی‌مانده)',1],['inh','ارث',0],['mah','مهریه',0],['ret','برگشت قرض یا سرمایه',0]],
+ expense:[['food','خوراک',1],['cloth','پوشاک',1],['home','اجاره یا قسط مسکن',1],['bill','قبوض و شارژ',1],['med','درمان',1],['trans','رفت‌وآمد و سوخت',1],['edu','تحصیل',1],['guest','مهمانی و هدیه',1],['ziy','زیارت و سفر',1],['char','صدقه و کمک به دیگران',1],['tax','مالیات و عوارض',1],['debt','پرداخت بدهی لازم',1],['oth','سایر مخارج متعارف',1]],
+ purchase:[['house','خانه برای سکونت خودم',1],['car','ماشین شخصی (متعارف)',1],['furn','لوازم منزل و جهیزیه',1],['jew','زیورآلات متعارف',1],['tool','تجهیزات لازم برای کار',1],['house2','خانه یا ملک اضافه / سرمایه‌گذاری',0],['car2','ماشین دوم یا لوکس',0],['land','زمین، طلا، ارز (سرمایه)',0],['lux','خرید تجملی بیش از شأن',0]]
+};
+const HINT={income:'طبق فتوای ایشان هدیه و جایزه هم درآمد است (بنابر احتیاط واجب). ارث و مهریه خمس ندارند.',expense:'همه‌ی این موارد از درآمد سال کم می‌شود (اگر در حد شأن باشد).',purchase:'وسیله‌ی لازم و متناسب با شأن که از درآمد همین سال خریده شود خمس ندارد. اگر سرمایه‌گذاری یا بیش از شأن باشد، خمس دارد.'};
+const KN={income:'درآمد',expense:'مخارج',purchase:'خرید'};
+const fl=(k,f)=>(FL[k].find(x=>x[0]===f)||[,'',0]);
+function fill(){const k=$('kind').value;$('flag').innerHTML=FL[k].map(f=>`<option value="${f[0]}">${f[1]}${k==='income'?(f[2]?' (خمس دارد)':' (بدون خمس)'):k==='purchase'?(f[2]?' (لازم)':' (غیرلازم)'):''}</option>`).join('');$('hint').textContent=HINT[k];$('flagl').textContent=k==='expense'?'دسته':'نوع';$('pf').classList.toggle('hide',k!=='purchase');prev()}
+$('kind').onchange=fill;
+// khums of one purchase
+function pk(i){const need=fl('purchase',i.flag)[2];const sh=i.shaan?Math.min(i.shaan,i.amt):i.amt;let b;if(i.src==='paid')b=i._e||0;else if(i.src==='unpaid')b=i.amt;else b=need?i.amt-sh:i.amt;return{b,k:b*0.2,ded:i.src==='year'&&need?sh:0}}
+function prev(){const p=$('pv');if($('kind').value!=='purchase'){p.classList.add('hide');return}const a=num($('amt').value);if(!a){p.classList.add('hide');return}
+ const r=pk({flag:$('flag').value,amt:a,src:$('src').value,shaan:num($('shaan').value),_e:Math.max(0,a-avail())});p.classList.remove('hide');
+ p.textContent=r.k?`خمس این خرید حدود ${fa(r.k)} تومان است (۲۰٪ از ${fa(r.b)} تومان که معاف نیست).`:'این خرید طبق شرایط واردشده خمس ندارد.'}
+['amt','shaan'].forEach(x=>$(x).oninput=prev);$('src').onchange=prev;$('flag').onchange=prev;
+
+const inYear=it=>!S.start||!it.date||it.date>=S.start;
+function avail(){let a=num(S.cleared);S.items.filter(i=>inYear(i)&&i.kind==='purchase'&&i.src==='paid').sort((x,y)=>(x.date||'').localeCompare(y.date||'')).forEach(i=>{const u=Math.min(i.amt,a);a-=u;i._e=i.amt-u});return a}
+const OL={mine:'معدن',treasure:'گنج',dive:'غواصی',mixed:'مال حلال مخلوط به حرام',dhimmi:'زمین خریداری‌شده‌ی ذمی'};
+function ok(i){const g=num(S.gold),v=num(S.silver);let n=0;if(i.flag==='treasure'){const a=g?69.12*g:0,b=v?483.84*v:0;n=a&&b?Math.min(a,b):(a||b)}else if(i.flag==='dive')n=g?3.456*g:0;return i.amt>=n?i.amt*0.2:0}
+function calc(){const av=avail();let inc=0,ex=0,pu=0,un=0;
+ S.items.filter(inYear).forEach(i=>{
+  if(i.kind==='income'&&fl('income',i.flag)[2])inc+=i.amt;
+  else if(i.kind==='expense')ex+=i.amt;
+  else if(i.kind==='purchase'){const r=pk(i);pu+=r.ded;if(i.src==='unpaid')un+=i.amt;if(i.src==='paid')un+=i._e||0}
+ });
+ const su=Math.max(0,inc-ex-pu),kh=Math.round((su+un)*0.2),pa=S.pays.filter(inYear).reduce((t,p)=>t+p.amt,0),bl=S.bal||0,ot=Math.round(S.others.filter(inYear).reduce((t,i)=>t+ok(i),0)),net=kh+ot-pa-bl;
+ return{inc,ex,pu,un,su,kh,ot,pa,bl,av,re:Math.max(0,net),over:net<0?-net:0}}
+function render(){const c=calc();
+ [['in','inc'],['ex','ex'],['pu','pu'],['un','un'],['su','su'],['kh','kh'],['ot','ot'],['pa','pa'],['re','re']].forEach(([a,b])=>$('s_'+a).textContent=fa(c[b]));
+ $('kh').textContent=fa(c.re)+' تومان';
+ $('s_bl').textContent=c.bl>0?'پیش‌پرداخت از سال قبل':c.bl<0?'خمس پرداخت‌نشده‌ی سال قبل':'تراز سال قبل';$('s_bv').textContent=fa(Math.abs(c.bl));
+ $('avn').textContent='قابل استفاده برای خرید در این سال: '+fa(c.av)+' تومان';
+ const pl=$('plist');pl.innerHTML='';S.pays.filter(inYear).forEach(p=>{const d=document.createElement('div');d.className='it';const l=document.createElement('div');l.textContent=showD(p.date)+(p.note?' · '+p.note:'');const r=document.createElement('div');const b=document.createElement('b');b.textContent=fa(p.amt)+' ';const x=document.createElement('button');x.className='x';x.textContent='×';x.onclick=()=>{S.pays=S.pays.filter(z=>z.id!==p.id);save();render()};r.append(b,x);d.append(l,r);pl.append(d)});
+ $('yc').classList.toggle('hide',!S.years.length);const yl=$('ylist');yl.innerHTML='';S.years.slice().reverse().forEach(y=>{const d=document.createElement('div');d.className='it';const l=document.createElement('div');l.textContent=showD(y.s)+' تا '+showD(y.e);const sm=document.createElement('small');sm.textContent='خمس: '+fa(y.kh)+' · پرداخت: '+fa(y.pa)+' · خمس‌داده‌شده: '+fa(y.cl);l.append(sm);d.append(l);yl.append(d)});
+ const due=c.kh+c.ot-c.bl,pc=due>0?Math.min(100,c.pa/due*100):0;$('rp').setAttribute('stroke-dasharray',pc+' '+(100-pc));$('rt').textContent=fa(pc)+'٪';
+ $('tl1').textContent=fa(c.inc);$('tl2').textContent=fa(c.ex+c.pu);$('tl3').textContent=fa(c.su+c.un);
+ const ey=S.start?(+S.start.slice(0,4)+1)+S.start.slice(4):'';$('yend').textContent=ey?'پایان سال خمسی: '+showD(ey)+(todayJ()>=ey?' — سال تمام شده؛ خمس را بپرداز و سال را ببند.':''):'با وارد کردن تاریخ شروع، پایان سال خمسی اینجا نشان داده می‌شود.';
+ const ol=$('olist');ol.innerHTML='';S.others.forEach(i=>{const d=document.createElement('div');d.className='it';const l=document.createElement('div');l.textContent=OL[i.flag]+(i.note?' · '+i.note:'');const sm=document.createElement('small');const k=ok(i);sm.textContent=showD(i.date)+' · '+(k?'خمس: '+fa(k)+' تومان'+((i.flag==='treasure'&&!S.gold&&!S.silver)||(i.flag==='dive'&&!S.gold)?' (نصاب نامشخص؛ قیمت طلا را وارد کن)':''):'کمتر از نصاب، بدون خمس');l.append(sm);const r=document.createElement('div');const b=document.createElement('b');b.textContent=fa(i.amt)+' ';const x=document.createElement('button');x.className='x';x.textContent='×';x.onclick=()=>{S.others=S.others.filter(z=>z.id!==i.id);save();render()};r.append(b,x);d.append(l,r);ol.append(d)});
+ $('khn').textContent=c.over?('بیش از خمس محاسبه‌شده پرداخته‌ای: '+fa(c.over)+' تومان'):(c.kh?'مانده‌ی خمس این سال':'فعلاً مازادی برای خمس نداری');
+ const l=$('list');l.innerHTML='';
+ if(!S.items.length){l.innerHTML='<div class="note">هنوز موردی ثبت نشده.</div>';return}
+ [...S.items].sort((a,b)=>(b.date||'').localeCompare(a.date||'')).forEach(i=>{
+  const d=document.createElement('div');d.className='it';
+  const left=document.createElement('div');
+  const t=document.createElement('span');t.className='tag';t.textContent=KN[i.kind];
+  const nm=document.createElement('span');nm.textContent=' '+fl(i.kind,i.flag)[1]+(i.note?' · '+i.note:'');
+  const sm=document.createElement('small');let x=showD(i.date);
+  if(i.kind==='purchase'){const r=pk(i);x+=r.k?' · خمس این خرید: '+fa(r.k)+' تومان':' · بدون خمس'}
+  else if(i.kind==='income')x+=fl('income',i.flag)[2]?' · خمس دارد':' · بدون خمس';
+  sm.textContent=x;left.append(t,nm,sm);
+  const right=document.createElement('div');right.style.whiteSpace='nowrap';
+  const b=document.createElement('b');b.textContent=fa(i.amt)+' ';
+  const xb=document.createElement('button');xb.className='x';xb.textContent='×';xb.onclick=()=>{S.items=S.items.filter(z=>z.id!==i.id);save();render()};
+  right.append(b,xb);d.append(left,right);l.append(d)})}
+mkDate('start',S.start,()=>{S.start=getDate('start');save();render()});
+mkDate('dt',todayJ());
+mkDate('pdt',todayJ());$('clr').value=S.cleared||'';$('clr').oninput=e=>{S.cleared=num(e.target.value);save();render();prev()};
+mkDate('odt',todayJ());$('gold').value=S.gold||'';$('silver').value=S.silver||'';$('silver').oninput=e=>{S.silver=num(e.target.value)||'';save();render()};$('gold').oninput=e=>{S.gold=num(e.target.value)||'';save();render()};
+$('oadd').onclick=()=>{const a=num($('oam').value);if(!a){$('oam').focus();return}S.others.push({id:Date.now()+Math.random(),flag:$('ofl').value,amt:a,date:getDate('odt'),note:$('ont').value.trim()});$('oam').value='';$('ont').value='';save();render()};
+function refresh(){mkDate('start',S.start,()=>{S.start=getDate('start');save();render()});$('clr').value=S.cleared||'';$('gold').value=S.gold||'';$('silver').value=S.silver||'';render()}
+$('bdl').onclick=async()=>{const t=JSON.stringify(S);$('bk').value=t;let d=null;try{d=await claude.use('downloads')}catch(e){}
+ if(!d){$('bn').textContent='دانلود در دسترس نیست؛ متن بالا را کپی و نگه دار.';return}
+ try{await d.save({filename:'khums-backup.json',data:t});$('bn').textContent='پشتیبان ذخیره شد. متن هم بالا هست.'}catch(e){$('bn').textContent='دانلود انجام نشد؛ متن بالا را کپی و نگه دار.'}};
+$('brs').onclick=()=>{try{const o=JSON.parse($('bk').value);if(!o||!Array.isArray(o.items))throw 0;S=Object.assign({start:'',paid:'',items:[],pays:[],cleared:0,bal:0,years:[],others:[],gold:''},o);save();refresh();$('bn').textContent='اطلاعات بازیابی شد.'}catch(e){$('bn').textContent='متن پشتیبان معتبر نیست.'}};
+['خمس هدیه و عیدی چطور است؟','خمس ماشین چطور حساب می‌شود؟','آیا طلا و زیورآلات خمس دارد؟','خمس حقوق ماهانه را کی بدهم؟','قسط خانه از خمس کم می‌شود؟'].forEach(t=>{const b=document.createElement('button');b.className='chip';b.textContent=t;b.onclick=()=>{$('q').value=t;send()};$('chips').append(b)});
+const Q=[['job','شغل و جایگاه',['کارگر یا کارمند ساده','کارمند رسمی یا معلم','کاسب و بازاری','متخصص (پزشک، مهندس، استاد...)','مدیر یا کارآفرین','کشاورز یا دامدار','بازنشسته','خانه‌دار','دانشجو']],['city','محل زندگی',['کلان‌شهر','شهر بزرگ','شهر متوسط','شهر کوچک','روستا']],['fam','تعداد افراد تحت تکفل (با خودت)',['۱','۲','۳','۴','۵ یا بیشتر']],['peer','سطح زندگی همتایانت (هم‌شغل‌ها و هم‌محله‌ای‌ها)',['ساده','متوسط','خوب','مرفه']],['house','وضعیت مسکن',['خانه ندارم','مستأجرم','خانه‌ی شخصی دارم']],['car','ماشین فعلی',['ندارم','ساده','متوسط','گران']],['spec','ملاحظات خاص',['ندارم','شغلم به ماشین نیاز دارد','مهمان‌داری و رفت‌وآمد زیاد','نیاز درمانی خاص','سفر شغلی یا خانوادگی زیاد']]];
+S.prof=S.prof||{};
+Q.forEach(([k,l,o])=>{const lb=document.createElement('label');lb.textContent=l;const se=document.createElement('select');se.innerHTML='<option value="">انتخاب کن</option>'+o.map(x=>`<option>${x}</option>`).join('');se.value=S.prof[k]||'';se.onchange=()=>{S.prof[k]=se.value;save()};$('qs').append(lb,se)});
+if(S.pt){$('pr').textContent=S.pt;$('pr').classList.remove('hide')}
+const PR='\nقواعد: شأن را عرف تعیین می‌کند و تشخیص نهایی با خود فرد و مرجع است؛ قیمت دقیق و ادعای قطعی نساز؛ فارسی، ساده و کوتاه بنویس.';
+const pfc=()=>Object.values(S.prof||{}).filter(Boolean).length;
+async function ask(p,el){el.classList.remove('hide');let sm=null;try{sm=await claude.use('sample')}catch(e){}
+ if(!sm){el.textContent='این بخش در دسترس نیست.';return}
+ el.textContent='در حال بررسی...';
+ try{const r=await sm(p,{cache:false,onText:({text})=>{el.textContent=text}});el.textContent=r.text;return r.text}
+ catch(e){el.textContent=e&&e.code==='no_key'?'کلید API تنظیم نشده؛ در تب «بات» وارد کن.':'خطا؛ دوباره امتحان کن.'}}
+$('anl').onclick=async()=>{if(pfc()<4){$('pr').classList.remove('hide');$('pr').textContent='دست‌کم چهار سؤال را جواب بده.';return}
+ const t=await ask('مشخصات این فرد: '+JSON.stringify(S.prof)+'\nشأن عرفی او را در چند خط تحلیل کن: برای خانه، ماشین، لوازم منزل، زیورآلات و مهمانی، هر کدام یک خط بگو چه سطحی برای او متعارف است. برای خمس لازم است بدانیم چه خریدهایی «متناسب با شأن» حساب می‌شود.'+PR,$('pr'));if(t){S.pt=t;save()}};
+$('chk').onclick=()=>{if(!pfc()){$('sv').classList.remove('hide');$('sv').textContent='اول تب «شأن» را پر کن.';return}
+ const a=num($('amt').value);ask('مشخصات کاربر: '+JSON.stringify(S.prof)+'\nخرید: '+fl('purchase',$('flag').value)[1]+'، مبلغ '+(a||'نامشخص')+' تومان، توضیح: '+($('nt').value||'-')+'\nبگو این خرید برای عرف چنین فردی «متناسب»، «کمی بالاتر» یا «خیلی بالاتر» از شأن است و چرا (حداکثر ۵ خط). اگر بالاتر است، توضیح بده چطور مبلغ سهم متناسب را برآورد کند (مثلاً قیمت یک نمونه‌ی متعارف بین همتایانش) تا در خانه‌ی «سهم متناسب با شأن» بنویسد.'+PR,$('sv'))};
+$('padd').onclick=()=>{const a=num($('pam').value);if(!a){$('pam').focus();return}S.pays.push({id:Date.now()+Math.random(),date:getDate('pdt'),amt:a,note:$('pnt').value.trim()});$('pam').value='';$('pnt').value='';save();render()};
+$('close').onclick=()=>{const c=calc();$('cft').textContent='خمس این سال '+fa(c.kh)+' تومان و پرداختی '+fa(c.pa)+' تومان است.'+(c.re?' هنوز '+fa(c.re)+' تومان مانده که به سال بعد منتقل می‌شود.':c.over?' '+fa(c.over)+' تومان پیش‌پرداخت به سال بعد منتقل می‌شود.':'')+' مازاد خمس‌داده به پس‌انداز خمس‌داده اضافه می‌شود و سال جدید از امروز شروع می‌شود.';$('cf').classList.remove('hide')};
+$('cfok').onclick=()=>{const c=calc(),t=todayJ(),tot=c.pa+c.bl,cl=Math.min(c.su+c.un,Math.max(0,tot-c.ot)/0.2);
+ S.years.push({s:S.start,e:t,kh:c.kh+c.ot,pa:c.pa,cl:cl});S.cleared=Math.round(c.av+cl);S.bal=tot-c.kh-c.ot;S.start=t;
+ mkDate('start',S.start,()=>{S.start=getDate('start');save();render()});$('clr').value=S.cleared||'';$('cf').classList.add('hide');save();render()};
+$('add').onclick=()=>{const a=num($('amt').value);if(!a){$('amt').focus();return}
+ const k=$('kind').value;
+ S.items.push({id:Date.now()+Math.random(),kind:k,flag:$('flag').value,amt:a,date:getDate('dt'),note:$('nt').value.trim(),src:$('src').value,shaan:num($('shaan').value)});
+ $('amt').value='';$('nt').value='';$('shaan').value='';save();render();prev()};
+function tab(n){[1,2,3,4].forEach(i=>{$('p'+i).classList.toggle('hide',i!==n);$('t'+i).classList.toggle('on',i===n)})}
+$('t1').onclick=()=>tab(1);$('t2').onclick=()=>tab(2);$('t3').onclick=()=>tab(3);$('t4').onclick=()=>tab(4);
+fill();
+
+let hist=[],busy=false;
+const SYS='تو دستیار پاسخ به سؤالات خمس هستی و باید بر اساس فتاوای آیت‌الله مکارم شیرازی (توضیح‌المسائل و استفتائات ایشان) به فارسی، کوتاه و روشن پاسخ بدهی. اگر از فتوای دقیق مطمئن نیستی، صریح بگو و کاربر را به makarem.ir یا دفتر ایشان ارجاع بده. فتوا از خودت نساز. احکام تأییدشده‌ی ایشان: خمس ارباح مکاسب ۲۰٪ مازاد بر مخارج سال است. هدیه و جایزه بنابر احتیاط واجب اگر از مخارج سال زیاد بیاید خمس دارد. ارث و مهریه خمس ندارند (مگر مورث خمس نداده باشد و وارث بداند). خانه، ماشین، لوازم و زیورآلات متعارف و در حد شأن و نیاز که از درآمد بین سال خریده شوند خمس ندارند؛ اگر با پس‌انداز بدون خمس تهیه شده باشند خمس دارند. افزایش قیمت سرمایه خمس دارد. نفقه و آذوقه‌ی باقی‌مانده در آخر سال خمس دارد. درآمد زن شاغل اگر مصرف نشود و سال بگذرد خمس دارد. دفاتر ایشان در محاسبه‌ی خمس کسانی که تا به حال خمس نداده‌اند از باب ارفاق چهار مورد را می‌بخشند: خانه‌ی مسکونی (حتی ییلاقی در حد شأن)، وسیله‌ی نقلیه، لوازم زندگی (حتی موبایل اگر وسیله‌ی کسب نباشد) و زیورآلات متعارف بانوان. معدن نصاب ندارد (احتیاط واجب)؛ نصاب گنج ۱۵ مثقال طلا یا ۱۰۵ مثقال نقره است. پرداخت خمس به مرجع خودش لازم نیست مگر مرجع به عنوان حکم حاکم بخواهد؛ عقب‌انداختن سال خمسی با اجازه‌ی حاکم شرع است. اطلاعات ثبت‌شده‌ی کاربر برای کمک به محاسبه:\n';
+function add(cls,txt){const d=document.createElement('div');d.className='m '+cls;d.textContent=txt;$('log').append(d);$('log').scrollTop=1e9;return d}
+async function send(){const q=$('q').value.trim();if(!q||busy)return;
+ let sample=null;try{sample=await claude.use('sample')}catch(e){}
+ if(!sample){$('cn').textContent='بات در این نمایش در دسترس نیست.';return}
+ busy=true;$('q').value='';add('u',q);hist.push({role:'user',content:q});
+ const c=calc();
+ const ctx=JSON.stringify({سال_خمسی_از:S.start||'نامشخص',درآمد_مشمول:c.inc,مخارج:c.ex,خرید_لازم_از_درآمد_سال:c.pu,خرید_از_پس‌انداز_بدون_خمس:c.un,مازاد:c.su,خمس:c.kh,پرداخت_شده:c.pa,پس‌انداز_خمس‌داده:c.av,شأن_کاربر:S.prof||'نامشخص',باقی:c.re});
+ const turns=hist.slice(-10).map((t,i)=>i===0&&t.role==='user'?{role:'user',content:SYS+ctx+'\n\nسؤال:\n'+t.content}:t);
+ if(turns[0].role!=='user')turns.shift();
+ const el=add('a','...');
+ try{const r=await sample(turns,{cache:false,onText:({text})=>{el.textContent=text;$('log').scrollTop=1e9}});el.textContent=r.text;hist.push({role:'assistant',content:r.text})}
+ catch(e){el.textContent=e&&e.code==='no_key'?'کلید API تنظیم نشده؛ پایین همین تب وارد کن.':'خطا در دریافت پاسخ'+(e&&e.message?': '+e.message:'')+'. دوباره امتحان کن.';hist.pop()}
+ busy=false}
+$('send').onclick=send;
+const apiKey=async k=>{const r=await fetch('/api/key',{method:k===undefined?'GET':'POST',headers:{'Content-Type':'application/json','X-Khums':'1'},body:k===undefined?undefined:JSON.stringify({key:k})});return r.json()};
+apiKey().then(d=>{$('apin').textContent=d.has?'کلید ذخیره شده است.':'کلیدی ذخیره نشده؛ بدون آن بات و تحلیل شأن کار نمی‌کنند.'}).catch(()=>{});
+$('apis').onclick=async()=>{const k=$('apik').value.trim();if(!k)return;const d=await apiKey(k);$('apik').value='';$('apin').textContent=d.has?'کلید ذخیره شد.':'ذخیره نشد.'};
+if(window.__HOSTED__){const l=$('apik').previousElementSibling;[l,$('apik'),$('apis'),$('apin')].forEach(x=>x&&(x.style.display='none'))}
+render();
+</script>
+</body>
+</html>
+'''
+
+if __name__ == "__main__":
+    main()
